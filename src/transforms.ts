@@ -6,6 +6,49 @@ const TOOL_PREFIX = "mcp_"
 const SYSTEM_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude."
 
+/**
+ * Patterns that identify OpenCode-fingerprinted content in system entries.
+ *
+ * Anthropic's OAuth API runs a content classifier on the system[] array that
+ * rejects requests containing OpenCode fingerprints with a misleading 400
+ * "out of extra usage" error (see issues #147 and #154). Empirical probing
+ * (April 2026) showed the classifier is multi-feature rather than simple
+ * substring matching — no single feature triggers the check in isolation,
+ * but combinations do. Rather than try to track the exact classifier
+ * threshold, we relocate any entry containing a known OpenCode feature.
+ *
+ * Entries matching any of these patterns are moved to the first user
+ * message; entries that don't match stay in system[] where they retain
+ * attention priority and prompt-cache efficiency.
+ */
+const OPENCODE_FEATURE_PATTERNS: RegExp[] = [
+  // Brand name, package name, or product URLs (case-insensitive, word
+  // boundary to avoid matching compound words like "opencoded").
+  /\bopencode\b/i,
+  // GitHub org used by OpenCode repositories
+  // (e.g. https://github.com/anomalyco/opencode).
+  /anomalyco/i,
+  // OpenCode-specific env metadata phrase. Claude Code's env block only
+  // uses "Working directory"; "Workspace root folder" is OpenCode-only.
+  /Workspace root folder/,
+  // OpenCode-specific env tag. Claude Code's env block has no
+  // <directories> section.
+  /<directories>/,
+]
+
+/**
+ * Returns true if the given system entry text contains any OpenCode
+ * fingerprint feature that would trigger Anthropic's OAuth content
+ * classifier. Such entries must be relocated out of system[] before
+ * sending the request.
+ *
+ * Non-matching entries (plain AGENTS.md, generic env blocks, skill lists,
+ * etc.) are safe to keep in system[].
+ */
+export function isOpenCodeBrandedEntry(text: string): boolean {
+  return OPENCODE_FEATURE_PATTERNS.some((pattern) => pattern.test(text))
+}
+
 type SystemEntry = { type?: string; text?: string } & Record<string, unknown>
 type ContentBlock = { type?: string; text?: string } & Record<string, unknown>
 type Message = {
@@ -153,15 +196,21 @@ export function transformBody(
     }
     parsed.system = splitSystem
 
-    // --- Relocate non-core system entries to user messages ---
-    // Anthropic's API now validates the system prompt for OAuth-authenticated
-    // requests that use Claude Code billing.  Third-party system prompts
-    // (like OpenCode's) trigger a 400 "out of extra usage" rejection when
-    // they appear inside the system[] array alongside the identity prefix.
+    // --- Surgically relocate OpenCode-fingerprinted system entries ---
+    // Anthropic's OAuth API runs a content classifier on the system[] array
+    // that rejects requests containing OpenCode fingerprints (see #147).
+    // The v1.4.8 fix (#148) worked around this by bulk-relocating ALL
+    // non-core system entries to the first user message, but this caused
+    // a regression in instruction-following for long conversations (#154)
+    // because system-level priority and prompt-cache efficiency were lost.
     //
-    // Work-around: keep only the billing header and identity prefix in
-    // system[], and prepend all other system content to the first user
-    // message where it is functionally equivalent but avoids the check.
+    // Empirical probing showed the classifier is feature-based: specific
+    // OpenCode markers (brand strings, anomalyco URLs, "Workspace root
+    // folder", <directories>) trigger the check, while AGENTS.md, skills
+    // blocks, Claude Code-format env blocks, and other non-branded content
+    // do not. We now relocate only entries matching an OpenCode feature
+    // pattern (see isOpenCodeBrandedEntry), keeping everything else in
+    // system[] where it retains full attention priority and caches well.
     const BILLING_PREFIX = "x-anthropic-billing-header"
     const keptSystem: SystemEntry[] = []
     const movedTexts: string[] = []
@@ -169,8 +218,10 @@ export function transformBody(
       const txt = typeof entry === "string" ? entry : (entry.text ?? "")
       if (txt.startsWith(BILLING_PREFIX) || txt.startsWith(SYSTEM_IDENTITY)) {
         keptSystem.push(entry)
-      } else if (txt.length > 0) {
+      } else if (txt.length > 0 && isOpenCodeBrandedEntry(txt)) {
         movedTexts.push(txt)
+      } else {
+        keptSystem.push(entry)
       }
     }
     if (movedTexts.length > 0 && Array.isArray(parsed.messages)) {

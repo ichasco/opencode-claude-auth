@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { describe, it } from "node:test"
 import {
+  isOpenCodeBrandedEntry,
   repairToolPairs,
   stripToolPrefix,
   transformBody,
@@ -8,6 +9,95 @@ import {
 } from "./transforms.ts"
 
 describe("transforms", () => {
+  describe("isOpenCodeBrandedEntry", () => {
+    it("matches 'OpenCode' brand name (case-insensitive)", () => {
+      assert.equal(isOpenCodeBrandedEntry("You are OpenCode"), true)
+      assert.equal(isOpenCodeBrandedEntry("you are opencode"), true)
+      assert.equal(isOpenCodeBrandedEntry("OPENCODE docs"), true)
+    })
+
+    it("matches anomalyco GitHub org", () => {
+      assert.equal(
+        isOpenCodeBrandedEntry(
+          "report at https://github.com/anomalyco/opencode",
+        ),
+        true,
+      )
+      assert.equal(isOpenCodeBrandedEntry("see anomalyco for details"), true)
+    })
+
+    it("matches OpenCode-specific env phrase 'Workspace root folder'", () => {
+      assert.equal(
+        isOpenCodeBrandedEntry(
+          "Working directory: /x\nWorkspace root folder: /x",
+        ),
+        true,
+      )
+    })
+
+    it("matches OpenCode-specific <directories> env tag", () => {
+      assert.equal(
+        isOpenCodeBrandedEntry("<directories>\n  /x\n</directories>"),
+        true,
+      )
+    })
+
+    it("does not match plain AGENTS.md project conventions", () => {
+      const agentsMd = `## Project Conventions
+- Use 2-space indentation
+- Run \`npm test\` before committing
+- Integration tests live in tests/integration/`
+      assert.equal(isOpenCodeBrandedEntry(agentsMd), false)
+    })
+
+    it("does not match Claude Code env format", () => {
+      const ccEnv = `Here is useful information about the environment you are running in:
+<env>
+Working directory: /home/user/project
+Is directory a git repo: Yes
+Platform: linux
+Today's date: 2026-04-09
+</env>`
+      assert.equal(isOpenCodeBrandedEntry(ccEnv), false)
+    })
+
+    it("does not match generic skills description block", () => {
+      const skills = `<available_skills>
+  <skill>
+    <name>test-driven-development</name>
+    <description>Use when implementing features</description>
+  </skill>
+</available_skills>`
+      assert.equal(isOpenCodeBrandedEntry(skills), false)
+    })
+
+    it("does not match unrelated words containing 'opencode' as substring", () => {
+      // Word boundary should prevent false matches on compound words.
+      assert.equal(isOpenCodeBrandedEntry("the opencoded scheme"), false)
+      assert.equal(isOpenCodeBrandedEntry("reopencoded"), false)
+    })
+
+    it("does not match empty or short strings", () => {
+      assert.equal(isOpenCodeBrandedEntry(""), false)
+      assert.equal(isOpenCodeBrandedEntry("hello"), false)
+    })
+
+    it("does not match billing header or identity prefix", () => {
+      assert.equal(
+        isOpenCodeBrandedEntry(
+          "x-anthropic-billing-header: cc_version=2.1.90.xxx; cc_entrypoint=cli; cch=abcde;",
+        ),
+        false,
+      )
+      assert.equal(
+        isOpenCodeBrandedEntry(
+          "You are Claude Code, Anthropic's official CLI for Claude.",
+        ),
+        false,
+      )
+    })
+  })
+
   it("transformBody moves non-core system text to user message and prefixes tool names", () => {
     const input = JSON.stringify({
       system: [{ type: "text", text: "OpenCode and opencode" }],
@@ -133,7 +223,7 @@ describe("transforms", () => {
     )
   })
 
-  it("transformBody splits concatenated identity prefix and relocates remainder to user message", () => {
+  it("transformBody splits concatenated identity prefix and keeps non-branded remainder in system", () => {
     const identity = "You are Claude Code, Anthropic's official CLI for Claude."
     const input = JSON.stringify({
       system: [
@@ -151,17 +241,17 @@ describe("transforms", () => {
       messages: Array<{ content: string }>
     }
 
-    // system[0] = billing header, system[1] = identity prefix
+    // system[0] = billing header, system[1] = identity prefix,
+    // system[2] = non-branded remainder (stays in system[])
+    assert.equal(parsed.system.length, 3)
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
-    // remainder is relocated to user message
-    assert.equal(parsed.system.length, 2)
-    assert.ok(
-      parsed.messages[0].content.includes("Working directory: /home/test"),
-    )
+    assert.equal(parsed.system[2].text, "Working directory: /home/test")
+    // User message is unchanged (no injection)
+    assert.equal(parsed.messages[0].content, "test")
   })
 
-  it("transformBody preserves identity without cache_control and relocates remainder", () => {
+  it("transformBody preserves identity without cache_control and keeps non-branded remainder in system", () => {
     const identity = "You are Claude Code, Anthropic's official CLI for Claude."
     const input = JSON.stringify({
       system: [
@@ -186,9 +276,15 @@ describe("transforms", () => {
       undefined,
       "Identity block must not have cache_control",
     )
-    // Remainder is relocated to user message, not kept in system
-    assert.equal(parsed.system.length, 2)
-    assert.ok(parsed.messages[0].content.includes("More content here"))
+    // Remainder is non-branded, so it stays in system[] with its cache_control
+    assert.equal(parsed.system.length, 3)
+    assert.equal(parsed.system[2].text, "More content here")
+    assert.deepEqual(parsed.system[2].cache_control, {
+      type: "ephemeral",
+      ttl: "1h",
+    })
+    // User message is unchanged
+    assert.equal(parsed.messages[0].content, "test")
   })
 
   it("transformBody does not split identity-only system entry", () => {
@@ -208,7 +304,7 @@ describe("transforms", () => {
     assert.equal(parsed.system[1].text, identity)
   })
 
-  it("transformBody removes duplicate billing headers and relocates non-core text", () => {
+  it("transformBody removes duplicate billing headers and keeps non-branded text in system", () => {
     const input = JSON.stringify({
       system: [
         {
@@ -238,11 +334,14 @@ describe("transforms", () => {
       billingEntries[0].text.includes("cch=fa690"),
       `Expected computed cch, got: ${billingEntries[0].text}`,
     )
-    // "prompt" should be relocated to user message
-    assert.ok(parsed.messages[0].content.includes("prompt"))
+    // "prompt" is non-branded, so it stays in system[]
+    const promptEntry = parsed.system.find((e) => e.text === "prompt")
+    assert.ok(promptEntry, "'prompt' should remain in system array")
+    // User message is unchanged (no prefix injection)
+    assert.equal(parsed.messages[0].content, "hey")
   })
 
-  it("transformBody relocates multiple non-core system entries to user message as content blocks", () => {
+  it("transformBody keeps multiple non-branded system entries in the system array", () => {
     const identity = "You are Claude Code, Anthropic's official CLI for Claude."
     const input = JSON.stringify({
       system: [
@@ -266,24 +365,169 @@ describe("transforms", () => {
       }>
     }
 
-    // system should only have billing header + identity
-    assert.equal(parsed.system.length, 2)
+    // system should have billing + identity + both custom blocks (all stay)
+    assert.equal(parsed.system.length, 4)
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
     assert.equal(parsed.system[1].text, identity)
-    // Both custom blocks should be prepended to user message content
-    assert.equal(parsed.messages[0].content[0].type, "text")
-    assert.ok(
-      parsed.messages[0].content[0].text.includes(
-        "Custom instructions block A",
-      ),
-    )
-    assert.ok(
-      parsed.messages[0].content[0].text.includes(
-        "Custom instructions block B",
-      ),
-    )
-    // Original user content preserved
-    assert.equal(parsed.messages[0].content[1].text, "hello")
+    assert.equal(parsed.system[2].text, "Custom instructions block A")
+    assert.equal(parsed.system[3].text, "Custom instructions block B")
+    // User message is unchanged (no prefix injection)
+    assert.equal(parsed.messages[0].content.length, 1)
+    assert.equal(parsed.messages[0].content[0].text, "hello")
+  })
+
+  it("transformBody keeps plain AGENTS.md content in system array", () => {
+    const agentsMd = `## Project Conventions
+- Use 2-space indentation
+- Run \`pnpm test\` before committing`
+    const input = JSON.stringify({
+      system: [{ type: "text", text: agentsMd }],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // AGENTS.md content has no OpenCode markers — stays in system[]
+    assert.equal(parsed.system.length, 2)
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.equal(parsed.system[1].text, agentsMd)
+    // User message unchanged
+    assert.equal(parsed.messages[0].content, "hello")
+  })
+
+  it("transformBody keeps Claude Code-format env block in system array", () => {
+    const ccEnvBlock = `Here is useful information about the environment you are running in:
+<env>
+Working directory: /home/user/project
+Is directory a git repo: Yes
+Platform: linux
+Today's date: 2026-04-09
+</env>`
+    const input = JSON.stringify({
+      system: [{ type: "text", text: ccEnvBlock }],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // CC-format env has no OpenCode-specific features — stays in system[]
+    assert.equal(parsed.system.length, 2)
+    assert.equal(parsed.system[1].text, ccEnvBlock)
+    assert.equal(parsed.messages[0].content, "hello")
+  })
+
+  it("transformBody keeps generic skills block in system array", () => {
+    const skillsBlock = `<available_skills>
+  <skill>
+    <name>test-driven-development</name>
+    <description>Use when implementing features</description>
+  </skill>
+</available_skills>`
+    const input = JSON.stringify({
+      system: [{ type: "text", text: skillsBlock }],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // Skills block has no OpenCode markers — stays in system[]
+    assert.equal(parsed.system.length, 2)
+    assert.equal(parsed.system[1].text, skillsBlock)
+  })
+
+  it("transformBody relocates entry containing anomalyco URL", () => {
+    const brandedEntry =
+      "Report feedback at https://github.com/anomalyco/opencode/issues"
+    const input = JSON.stringify({
+      system: [{ type: "text", text: brandedEntry }],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // Branded entry is relocated; system has only billing header
+    assert.equal(parsed.system.length, 1)
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.ok(parsed.messages[0].content.includes(brandedEntry))
+  })
+
+  it("transformBody relocates OpenCode env block with <directories> tag", () => {
+    const opencodeEnv = `Here is some useful information about the environment you are running in:
+<env>
+  Working directory: /home/user/project
+  Workspace root folder: /home/user/project
+</env>
+<directories>
+  /home/user/project
+</directories>`
+    const input = JSON.stringify({
+      system: [{ type: "text", text: opencodeEnv }],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // Contains BOTH 'Workspace root folder' and '<directories>' — relocated
+    assert.equal(parsed.system.length, 1)
+    assert.ok(parsed.messages[0].content.includes("<directories>"))
+    assert.ok(parsed.messages[0].content.includes("Workspace root folder"))
+  })
+
+  it("transformBody surgically relocates only branded entries in mixed system input", () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+    const agentsMd = "## Conventions\n- Use 2-space indentation"
+    const ccEnvBlock = `<env>\nWorking directory: /x\nIs directory a git repo: Yes\n</env>`
+    const opencodeCore =
+      "You are OpenCode, the best coding agent on the planet."
+    const skillsBlock = `<available_skills>\n  <skill>\n    <name>tdd</name>\n  </skill>\n</available_skills>`
+
+    const input = JSON.stringify({
+      system: [
+        { type: "text", text: identity },
+        { type: "text", text: agentsMd },
+        { type: "text", text: ccEnvBlock },
+        { type: "text", text: opencodeCore },
+        { type: "text", text: skillsBlock },
+      ],
+      messages: [{ role: "user", content: "hello" }],
+    })
+
+    const output = transformBody(input)
+    const parsed = JSON.parse(output as string) as {
+      system: Array<{ text: string }>
+      messages: Array<{ content: string }>
+    }
+
+    // Kept in system: billing + identity + agentsMd + ccEnvBlock + skillsBlock
+    assert.equal(parsed.system.length, 5)
+    assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.equal(parsed.system[1].text, identity)
+    assert.equal(parsed.system[2].text, agentsMd)
+    assert.equal(parsed.system[3].text, ccEnvBlock)
+    assert.equal(parsed.system[4].text, skillsBlock)
+    // Only opencodeCore is relocated to user message
+    assert.ok(parsed.messages[0].content.includes(opencodeCore))
+    assert.ok(!parsed.messages[0].content.includes(agentsMd))
   })
 
   it("transformBody keeps system intact when no messages exist", () => {
