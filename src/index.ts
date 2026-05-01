@@ -11,7 +11,12 @@ import {
   isLongContextError,
   LONG_CONTEXT_BETAS,
 } from "./betas.ts"
-import { transformBody, transformResponseStream } from "./transforms.ts"
+import {
+  looksLikeOpenCodeJoinedBlob,
+  splitOpenCodeSystemBlob,
+  transformBody,
+  transformResponseStream,
+} from "./transforms.ts"
 import { applyOpencodeConfig } from "./plugin-config.ts"
 import {
   getCachedCredentials,
@@ -35,6 +40,10 @@ export {
 } from "./betas.ts"
 export { resetExcludedBetas } from "./betas.ts"
 export {
+  isOpenCodeBrandedEntry,
+  looksLikeOpenCodeJoinedBlob,
+  normalizeEnvBlock,
+  splitOpenCodeSystemBlob,
   stripToolPrefix,
   transformBody,
   transformResponseStream,
@@ -229,6 +238,39 @@ const plugin: Plugin = async () => {
       const hasIdentityPrefix = output.system.some((entry) =>
         entry.includes(SYSTEM_IDENTITY_PREFIX),
       )
+
+      // OpenCode's session/llm.ts joins provider-prompt + input.system +
+      // input.user.system into a single string before triggering this hook
+      // (see anomalyco/opencode `packages/opencode/src/session/llm.ts:88-103`).
+      // That defeats the per-entry surgical relocation in transformBody:
+      // the joined blob carries OpenCode fingerprints, so the entire blob
+      // — AGENTS.md, skills, env, and provider prompt together — gets
+      // moved out of system[] into the first user message, re-creating
+      // regression #154.
+      //
+      // We split the joined blob back into its constituent pieces here so
+      // each piece can be evaluated by isOpenCodeBrandedEntry independently.
+      // Replacing output.system (rather than mutating in place after index 0)
+      // also bypasses OpenCode's rejoin guard at llm.ts:107-111, which would
+      // otherwise fold our split entries back into a single string when
+      // system.length > 2 && system[0] === original header.
+      const combinedIdx = output.system.findIndex((entry) =>
+        looksLikeOpenCodeJoinedBlob(entry),
+      )
+      if (combinedIdx >= 0) {
+        const split = splitOpenCodeSystemBlob(output.system[combinedIdx])
+        const before = output.system.slice(0, combinedIdx)
+        const after = output.system.slice(combinedIdx + 1)
+        output.system.length = 0
+        if (!hasIdentityPrefix) output.system.push(SYSTEM_IDENTITY_PREFIX)
+        output.system.push(
+          ...before.filter((e) => e !== SYSTEM_IDENTITY_PREFIX),
+          ...split.filter(Boolean),
+          ...after,
+        )
+        return
+      }
+
       if (!hasIdentityPrefix) {
         output.system.unshift(SYSTEM_IDENTITY_PREFIX)
       }

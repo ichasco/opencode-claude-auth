@@ -22,12 +22,20 @@ const SYSTEM_IDENTITY =
  * attention priority and prompt-cache efficiency.
  */
 const OPENCODE_FEATURE_PATTERNS: RegExp[] = [
-  // Brand name, package name, or product URLs (case-insensitive, word
-  // boundary to avoid matching compound words like "opencoded").
-  /\bopencode\b/i,
+  // Brand prose. Case-SENSITIVE PascalCase: anthropic.txt and other
+  // OpenCode prompts use "OpenCode" consistently. Lowercase "opencode"
+  // appears almost exclusively in directory/path components like
+  // /Users/foo/dev/opencode-claude-auth/... or
+  // /Users/foo/.cache/opencode/... and matching those produces false
+  // positives that relocate non-branded content (e.g. user env blocks,
+  // skills entries) needlessly.
+  /\bOpenCode\b/,
   // GitHub org used by OpenCode repositories
   // (e.g. https://github.com/anomalyco/opencode).
-  /anomalyco/i,
+  /\banomalyco\b/i,
+  // OpenCode docs/site URL — strong contextual brand signal even in
+  // lowercase form.
+  /\bopencode\.ai\b/i,
   // OpenCode-specific env metadata phrase. Claude Code's env block only
   // uses "Working directory"; "Workspace root folder" is OpenCode-only.
   /Workspace root folder/,
@@ -47,6 +55,155 @@ const OPENCODE_FEATURE_PATTERNS: RegExp[] = [
  */
 export function isOpenCodeBrandedEntry(text: string): boolean {
   return OPENCODE_FEATURE_PATTERNS.some((pattern) => pattern.test(text))
+}
+
+/**
+ * Anchors used by splitOpenCodeSystemBlob to recognize OpenCode's joined
+ * system blob. These mirror upstream OpenCode source as of dev branch:
+ *
+ *   - ENV_BLOCK_RE: `packages/opencode/src/session/system.ts` `environment()`
+ *     produces "You are powered by the model named ...\n...\n<env>...</env>"
+ *   - SKILLS_BLOCK_RE: superpowers (and similar plugins) emit
+ *     "Skills provide specialized instructions...\n<available_skills>...</available_skills>"
+ *   - INSTRUCTIONS_HEADER_RE: `packages/opencode/src/session/instruction.ts`
+ *     emits each AGENTS.md/CLAUDE.md as "Instructions from: <abs-path>\n<content>"
+ *
+ * Splitting is best-effort and gracefully degrades to pass-through for
+ * unfamiliar shapes, so behavior is never worse than v1.4.8 bulk relocation.
+ */
+const ENV_BLOCK_RE =
+  /^You are powered by the model named [^\n]+\n[\s\S]*?<\/env>/m
+const SKILLS_BLOCK_RE =
+  /^Skills provide specialized instructions and workflows for specific tasks\.\n[\s\S]*?<\/available_skills>/m
+const INSTRUCTIONS_HEADER_RE = /\n(?=Instructions from: [/~])/
+const ENV_OPENER_RE =
+  /^You are powered by the model named [^\n]+\nHere is some useful information about the environment you are running in:\n/
+const ENV_WORKSPACE_ROOT_RE = /^[ \t]*Workspace root folder:[^\n]*\n?/m
+const ENV_CONTAINER_RE = /<env>([\s\S]*?)<\/env>/
+
+/**
+ * Normalize an OpenCode env block into two pieces: a Claude-Code-shaped
+ * "safe" env that can stay in system[], and a "branded" extras string
+ * containing the OpenCode-only opener and `Workspace root folder` line that
+ * must relocate.
+ *
+ * Returns `{ safe: null, branded: input }` when the env block doesn't match
+ * the expected shape — graceful fallback that preserves current behavior
+ * (relocate the whole thing).
+ */
+export function normalizeEnvBlock(envBlock: string): {
+  safe: string | null
+  branded: string | null
+} {
+  const containerMatch = envBlock.match(ENV_CONTAINER_RE)
+  if (!containerMatch) {
+    return { safe: null, branded: envBlock }
+  }
+
+  // Pull off the OpenCode-only opener (two lines) before "<env>".
+  const openerMatch = envBlock.match(ENV_OPENER_RE)
+  const opener = openerMatch ? openerMatch[0] : ""
+
+  // Strip the OpenCode-only "Workspace root folder: ..." line from the
+  // <env> body, leaving only Claude-Code-format lines.
+  const envBody = containerMatch[1]
+  const workspaceLineMatch = envBody.match(ENV_WORKSPACE_ROOT_RE)
+  const workspaceLine = workspaceLineMatch ? workspaceLineMatch[0] : ""
+  const safeBody = envBody.replace(ENV_WORKSPACE_ROOT_RE, "")
+
+  // Compose the safe env (Claude-Code-shaped) and branded extras.
+  const safe =
+    `Here is useful information about the environment you are running in:\n` +
+    `<env>${safeBody}</env>`
+
+  const brandedParts: string[] = []
+  if (opener) brandedParts.push(opener.trimEnd())
+  if (workspaceLine) brandedParts.push(workspaceLine.trim())
+  const branded = brandedParts.length > 0 ? brandedParts.join("\n") : null
+
+  return { safe, branded }
+}
+
+/**
+ * Split OpenCode's joined system blob (produced by
+ * `packages/opencode/src/session/llm.ts:88-103`) back into its constituent
+ * entries so that downstream surgical relocation in `transformBody` can
+ * keep non-branded pieces (AGENTS.md, skills, safe env) in `system[]`.
+ *
+ * For unfamiliar shapes the input is returned unchanged as a single-entry
+ * array, so callers can pass any string through without a behavioral
+ * regression.
+ *
+ * The returned ordering preserves OpenCode's original assembly order:
+ *   [providerPromptHead?, brandedEnvExtras?, safeEnv?, skillsBlock?,
+ *    ...instructionBlocks, userSystemTail?]
+ */
+export function splitOpenCodeSystemBlob(text: string): string[] {
+  const envMatch = text.match(ENV_BLOCK_RE)
+  if (!envMatch || envMatch.index === undefined) {
+    return [text]
+  }
+
+  // Slice the joined string at the env-block boundary.
+  const head = text.slice(0, envMatch.index).replace(/\n+$/, "")
+  const envBlock = envMatch[0]
+  let tail = text.slice(envMatch.index + envBlock.length).replace(/^\n+/, "")
+
+  // Normalize the env block.
+  const { safe, branded } = normalizeEnvBlock(envBlock)
+
+  // Optionally peel off a skills block from the tail.
+  let skillsBlock: string | null = null
+  const skillsMatch = tail.match(SKILLS_BLOCK_RE)
+  if (skillsMatch && skillsMatch.index !== undefined) {
+    skillsBlock = skillsMatch[0]
+    const before = tail.slice(0, skillsMatch.index).replace(/\n+$/, "")
+    const after = tail
+      .slice(skillsMatch.index + skillsBlock.length)
+      .replace(/^\n+/, "")
+    tail = [before, after].filter(Boolean).join("\n")
+  }
+
+  // Split remaining tail on "Instructions from: ..." headers — these are
+  // AGENTS.md / CLAUDE.md blocks emitted one per file by upstream
+  // `Instruction.system()`.
+  const instructionPieces: string[] = []
+  let userSystemTail: string | null = null
+  if (tail) {
+    const parts = tail.split(INSTRUCTIONS_HEADER_RE)
+    // Anything before the first "Instructions from:" header is non-AGENTS
+    // tail (typically input.user.system or a structured-output prompt).
+    if (parts.length > 0 && !parts[0].startsWith("Instructions from:")) {
+      const firstTail = parts.shift()!
+      if (firstTail.trim()) userSystemTail = firstTail
+    }
+    for (const part of parts) {
+      if (part.trim()) instructionPieces.push(part)
+    }
+  }
+
+  const out: string[] = []
+  if (head) out.push(head)
+  if (branded) out.push(branded)
+  if (safe) out.push(safe)
+  if (skillsBlock) out.push(skillsBlock)
+  out.push(...instructionPieces)
+  if (userSystemTail) out.push(userSystemTail)
+  return out
+}
+
+/**
+ * Heuristic: does this string look like OpenCode's joined system blob?
+ * Used by callers (the system.transform hook) to decide whether to invoke
+ * splitOpenCodeSystemBlob. We require both the env-block opener sentinel
+ * and at least one OpenCode brand fingerprint, so unrelated multi-section
+ * prompts pass through unchanged.
+ */
+export function looksLikeOpenCodeJoinedBlob(text: string): boolean {
+  return (
+    /^You are powered by the model named/m.test(text) &&
+    /\bopencode\b/i.test(text)
+  )
 }
 
 type SystemEntry = { type?: string; text?: string } & Record<string, unknown>
