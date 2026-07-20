@@ -65,6 +65,47 @@ function getUserAgent(): string {
   )
 }
 
+// Allows routing requests through a proxy (e.g. LiteLLM) while still using
+// Claude Code OAuth credentials for authentication.
+function getBaseUrl(): string {
+  return process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1"
+}
+
+// Parses ANTHROPIC_CUSTOM_HEADERS, supporting three formats:
+//   - JSON object: '{"x-my-header":"value"}'
+//   - "key: value" pairs (comma separated, HTTP-style)
+//   - "key=value" pairs (comma separated)
+function getCustomHeaders(): Record<string, string> {
+  const raw = process.env.ANTHROPIC_CUSTOM_HEADERS
+  if (!raw) return {}
+
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === "object") return parsed
+  } catch {}
+
+  const colonPairs = raw.match(/([a-zA-Z0-9-]+):\s*([^,]+)/g)
+  if (colonPairs) {
+    const headers: Record<string, string> = {}
+    for (const pair of colonPairs) {
+      const idx = pair.indexOf(":")
+      if (idx > 0) {
+        const key = pair.slice(0, idx).trim()
+        const value = pair.slice(idx + 1).trim()
+        if (key && value) headers[key] = value
+      }
+    }
+    if (Object.keys(headers).length > 0) return headers
+  }
+
+  const headers: Record<string, string> = {}
+  for (const pair of raw.split(",")) {
+    const [key, ...rest] = pair.split("=")
+    if (key && rest.length) headers[key.trim()] = rest.join("=").trim()
+  }
+  return headers
+}
+
 function getStainlessHeaders(): Record<string, string> {
   return {
     "x-stainless-arch": process.arch === "arm64" ? "arm64" : process.arch,
@@ -208,6 +249,11 @@ export function buildRequestHeaders(
   for (const [key, value] of Object.entries(getStainlessHeaders())) {
     if (!headers.has(key)) headers.set(key, value)
   }
+  // Allow extra headers required by an intermediary proxy (e.g. LiteLLM's
+  // "x-litellm-api-key") without disturbing Anthropic OAuth auth headers.
+  for (const [key, value] of Object.entries(getCustomHeaders())) {
+    headers.set(key, value)
+  }
   headers.delete("x-api-key")
 
   return headers
@@ -315,7 +361,7 @@ const plugin: Plugin = async () => {
 
         return {
           apiKey: "",
-          baseURL: "https://api.anthropic.com/v1",
+          baseURL: getBaseUrl(),
           async fetch(input: RequestInfo | URL, init?: RequestInit) {
             const latest = getCachedCredentials()
             if (!latest) {
